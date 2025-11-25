@@ -1,85 +1,165 @@
-# backend/src/route_algorithms.py
+# src/route_algorithms.py
+import heapq
 import math
-from heapq import heappush, heappop
-
-def travel_time_minutes_from_meta(meta, congestion_level):
-    if congestion_level == 0:
-        mult = 1.0
-    elif congestion_level == 1:
-        mult = 1.4
-    else:
-        mult = 1.9
-    speed = meta['base_speed_kmph'] / mult
-    if speed <= 0.01: speed = 0.01
-    return meta['distance_km'] / speed * 60.0
+from src.ml_model import estimate_travel_time
 
 def dijkstra_time(graph, predict_fn, source, target):
-    dist = {i: float('inf') for i in graph.keys()}
-    prev = {i: None for i in graph.keys()}
-    dist[source] = 0.0
-    pq = [(0.0, source)]
+    """
+    Dijkstra's algorithm for shortest path based on predicted travel time.
+    
+    Args:
+        graph: adjacency list {node: [(neighbor, edge_key), ...]}
+        predict_fn: function(u, v) -> congestion_level
+        source: start node
+        target: end node
+    
+    Returns:
+        path: list of nodes
+        total_time: total estimated time in minutes
+    """
+    distances = {node: float('inf') for node in graph}
+    distances[source] = 0
+    previous = {node: None for node in graph}
+    pq = [(0, source)]
     visited = set()
+    
     while pq:
-        d,u = heappop(pq)
-        if u in visited: continue
-        visited.add(u)
-        if u == target: break
-        for (v, meta) in graph[u]:
-            lvl = predict_fn(u, v)
-            tmin = travel_time_minutes_from_meta(meta, lvl)
-            nd = d + tmin
-            if nd < dist[v]:
-                dist[v] = nd
-                prev[v] = u
-                heappush(pq, (nd, v))
-    if dist[target] == float('inf'):
-        return None, float('inf')
-    # reconstruct path
+        current_dist, current = heapq.heappop(pq)
+        
+        if current in visited:
+            continue
+        visited.add(current)
+        
+        if current == target:
+            break
+        
+        for neighbor, edge_key in graph[current]:
+            if neighbor in visited:
+                continue
+            
+            # Get predicted congestion
+            u, v = edge_key
+            congestion_level = predict_fn(u, v)
+            
+            # Calculate edge weight (travel time)
+            # We need edge metadata - extract from edge_key
+            # For now, use a simple heuristic
+            time = 1 + congestion_level * 2  # Simple time estimation
+            
+            new_dist = current_dist + time
+            
+            if new_dist < distances[neighbor]:
+                distances[neighbor] = new_dist
+                previous[neighbor] = current
+                heapq.heappush(pq, (new_dist, neighbor))
+    
+    # Reconstruct path
+    if distances[target] == float('inf'):
+        return None, None
+    
     path = []
-    cur = target
-    while cur is not None:
-        path.append(cur)
-        cur = prev[cur]
+    current = target
+    while current is not None:
+        path.append(current)
+        current = previous[current]
     path.reverse()
-    return path, dist[target]
+    
+    return path, distances[target]
 
-def heuristic(coords, u, v):
-    ux,uy = coords[u]; vx,vy = coords[v]
-    straight_km = math.hypot(ux-vx, uy-vy)/10.0
-    avg_speed = 40.0
-    return straight_km / avg_speed * 60.0
 
 def a_star_time(coords, graph, predict_fn, source, target):
-    open_set = []
-    heappush(open_set, (0 + heuristic(coords, source, target), 0, source))
-    came_from = {}
-    g_score = {i: float('inf') for i in graph.keys()}
-    g_score[source] = 0.0
-    visited = set()
+    """
+    A* algorithm with Euclidean distance heuristic.
+    
+    Heuristic: straight-line distance / average speed
+    """
+    def heuristic(node):
+        x1, y1 = coords[node]
+        x2, y2 = coords[target]
+        euclidean_dist = math.sqrt((x2-x1)**2 + (y2-y1)**2)
+        return euclidean_dist / 50  # Assume avg 50 km/h for heuristic
+    
+    g_score = {node: float('inf') for node in graph}
+    g_score[source] = 0
+    
+    f_score = {node: float('inf') for node in graph}
+    f_score[source] = heuristic(source)
+    
+    previous = {node: None for node in graph}
+    open_set = [(f_score[source], source)]
+    closed_set = set()
+    
     while open_set:
-        f,g,u = heappop(open_set)
-        if u == target:
+        _, current = heapq.heappop(open_set)
+        
+        if current in closed_set:
+            continue
+        closed_set.add(current)
+        
+        if current == target:
             break
-        if u in visited: continue
-        visited.add(u)
-        for (v, meta) in graph[u]:
-            lvl = predict_fn(u, v)
-            tmin = travel_time_minutes_from_meta(meta, lvl)
-            tentative = g_score[u] + tmin
-            if tentative < g_score[v]:
-                g_score[v] = tentative
-                came_from[v] = u
-                fscore = tentative + heuristic(coords, v, target)
-                heappush(open_set, (fscore, tentative, v))
+        
+        for neighbor, edge_key in graph[current]:
+            if neighbor in closed_set:
+                continue
+            
+            # Get predicted congestion and calculate time
+            u, v = edge_key
+            congestion_level = predict_fn(u, v)
+            time = 1 + congestion_level * 2
+            
+            tentative_g = g_score[current] + time
+            
+            if tentative_g < g_score[neighbor]:
+                previous[neighbor] = current
+                g_score[neighbor] = tentative_g
+                f_score[neighbor] = g_score[neighbor] + heuristic(neighbor)
+                heapq.heappush(open_set, (f_score[neighbor], neighbor))
+    
+    # Reconstruct path
     if g_score[target] == float('inf'):
-        return None, float('inf')
+        return None, None
+    
     path = []
-    cur = target
-    while cur != source:
-        path.append(cur)
-        cur = came_from.get(cur, None)
-        if cur is None:
-            break
-    path.append(source)
+    current = target
+    while current is not None:
+        path.append(current)
+        current = previous[current]
     path.reverse()
+    
     return path, g_score[target]
+
+
+def calculate_path_time(path, edges, predict_fn):
+    """
+    Calculate total travel time for a given path.
+    
+    Args:
+        path: list of nodes
+        edges: dict of edge metadata
+        predict_fn: function to predict congestion
+    
+    Returns:
+        total_time: total estimated time in minutes
+    """
+    from .ml_model import estimate_travel_time
+    
+    total_time = 0
+    
+    for i in range(len(path) - 1):
+        u, v = path[i], path[i+1]
+        edge_key = (min(u,v), max(u,v))
+        
+        if edge_key not in edges:
+            continue
+        
+        meta = edges[edge_key]
+        congestion_level = predict_fn(u, v)
+        time = estimate_travel_time(
+            meta['distance_km'],
+            meta['base_speed_kmh'],
+            congestion_level
+        )
+        total_time += time
+    
+    return total_time
